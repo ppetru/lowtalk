@@ -37,7 +37,7 @@ finally:
 
 
 class TerminalTests(unittest.TestCase):
-    def test_incoming_message_does_not_disturb_editing_and_resize(self):
+    def test_editing_truncation_and_resize_during_message_receipt(self):
         with socket.socket() as first, socket.socket() as second:
             first.bind(("127.0.0.1", 0))
             second.bind(("127.0.0.1", 0))
@@ -87,6 +87,12 @@ class TerminalTests(unittest.TestCase):
             os.write(master, b"l\n")
             pump_until(lambda: any(text == "hello" for _, text in events))
             self.assertEqual(sum(text == "hello" for _, text in events), 1)
+            # Exercise the actual per-key limit and its visible draft warning.
+            os.write(master, b"x" * 4001)
+            pump_until(lambda: b"Input truncated" in output)
+            os.write(master, b"\n")
+            pump_until(lambda: any(text == "x" * 4000 for _, text in events))
+            self.assertEqual(sum(text == "x" * 4000 for _, text in events), 1)
             # Force a small layout and restore it. Ctrl-L requests a repaint.
             fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 4, 18, 0, 0))
             process.send_signal(signal.SIGWINCH)

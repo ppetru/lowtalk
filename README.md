@@ -1,152 +1,69 @@
 # Lowtalk
 
-Small, serverless terminal chat for trusted friends on Tailscale. Python 3.10+
-with standard-library `curses`, on Linux or macOS. No pip packages, accounts,
-chat server, database, or persisted chat logs.
+Small, serverless terminal chat for trusted friends on Tailscale. Runs on Linux
+and macOS with Python 3.10+ and `curses`; no pip packages or chat server needed.
+No saved chat logs.
 
 ## Run
 
-Keep `lowtalk.py` and the four `chat_*.py` modules together. In your working
-directory, create `friends_tailscale_ips.txt` listing **the other participants**:
+Keep `lowtalk.py` and the four `chat_*.py` modules together. Create
+`friends_tailscale_ips.txt` in the **directory you run from**, listing everyone
+else's Tailscale IPv4 address or DNS name:
 
 ```text
-# Tailscale IPv4 address or DNS name; optional destination port
+# Optional second column: the port that friend listens on
 100.101.102.103
 friend-machine.your-tailnet.ts.net 8888
 ```
 
-Then run:
-
 ```sh
-python3 /path/to/lowtalk.py guest
-# Or listen locally on a different port:
-python3 /path/to/lowtalk.py guest 8888
+python3 /path/to/lowtalk.py your-nickname
+# Optional local listening port:
+python3 /path/to/lowtalk.py your-nickname 8888
 ```
 
-The local listening port defaults to **7777**. Each peer's destination port also
-independently defaults to **7777**; the CLI port does not change destinations.
-Everyone maintains their own file listing everyone else, with the port on which
-each friend actually listens. Blank lines and `#` comments are supported.
+Ports default to **7777**. Changing your local port does not change your friends'
+destination ports. Everyone needs their own file listing everyone else; entries
+must resolve to distinct IPv4 addresses. Restart after editing the file or changing
+DNS. The friends file is excluded from Git.
 
-The peer file is loaded from the **current working directory**, not the script's
-directory. Names resolve to IPv4 addresses once at startup; restart after file
-edits or DNS changes. The friends file is private local configuration and is
-excluded from Git by `.gitignore`.
+Tailscale must be running, and Tailscale access rules and host firewalls must allow
+inbound **TCP** on each participant's listening port.
 
-Entries must not resolve to overlapping addresses, since
-inbound membership is identified by source IP. IPv6-only peers are not supported.
-Configuration errors and an occupied listening port stop startup.
+## Using it
 
-Tailscale must already be running and its access rules (and host firewall) must
-permit the chosen **TCP** ports between participants. This is not wire-compatible
-with the original UDP shell prototype.
-
-## Interface
-
-- Compact friends/status strip at the top, normally just one row. `/who` shows
-  addresses, ports, and the last connection error in more detail.
-- Message list with local `HH:MM` timestamps, nicknames, and incoming source IPs.
-  Times reflect local receipt/send attempts, not the sender's clock.
-- Separate, horizontally scrolling input line. Incoming messages leave the draft
-  and cursor untouched. Enter sends; whitespace-only input does nothing.
-- Page Up / Page Down browse up to **1,000 in-memory entries**. While browsing,
-  incoming messages increment an unread count without jumping to the bottom.
-  Page Down returns to the live view. Oldest entries are eventually evicted.
-- `/quit` or Ctrl-C exits. Use `//text` to send a literal leading `/text`.
-
-Editing is a small readline-style subset, not GNU readline:
+- Enter sends to currently connected friends. Incoming messages leave your draft
+  and cursor alone. Nicknames can contain up to 32 characters.
+- The top strip shows connections; `/who` shows addresses and connection errors.
+  Connections recover automatically, though detecting a lost peer can take about
+  30 seconds.
+- Page Up / Page Down browse the last **1,000 in-memory entries**, with an unread
+  count while browsing. Page down to the bottom to return to live messages.
+- `/quit` or Ctrl-C exits. `//text` sends a literal leading `/text`.
+- Messages are limited to **4,000 characters**. Excess input is discarded with a
+  warning. **Pasted newlines send messages**, just like Enter.
 
 | Keys | Action |
 | --- | --- |
-| Left / Right, Ctrl-B / Ctrl-F | Move one character |
+| Left / Right, Ctrl-B / Ctrl-F | Move cursor |
 | Home / End, Ctrl-A / Ctrl-E | Beginning / end |
 | Backspace / Delete, Ctrl-D | Delete before / at cursor |
-| Ctrl-W | Cut preceding whitespace-delimited word |
+| Ctrl-W | Cut preceding word |
 | Ctrl-U / Ctrl-K | Cut to beginning / end |
-| Ctrl-Y | Paste the last cut (one slot, no kill ring) |
+| Ctrl-Y | Paste the last cut |
 | Ctrl-L | Repaint |
 
-Input is single-line, with no sent-message recall or multiline paste mode.
-Pasted newlines send messages, just like Enter. Character widths use Unicode's
-combining and East Asian width properties; complex emoji/grapheme editing may
-not match every terminal. Very small terminals show a resize notice while
-networking continues.
+There is no sent-message recall or offline queue. Your own messages appear locally
+even if nobody is connected; warnings identify unavailable recipients. A successful
+send is not proof that someone saw the message, and interrupted messages are not
+replayed.
 
-## Connection and security behavior
+## Privacy
 
-- Best-effort `tailscale ip -4` discovery, with a three-second timeout. If discovery
-  fails, or the discovered address cannot be bound, the app visibly warns and
-  listens on all IPv4 interfaces. A bind conflict is never silently bypassed.
-- **Every inbound connection is checked against the resolved peer-address
-  allowlist before any chat data is sent.** This identifies machines, not users
-  or processes. Nicknames are self-chosen, not authenticated identities.
-- There is no application encryption. Use Tailscale addresses/names: explicitly
-  configuring a LAN/public address can send unencrypted traffic outside Tailscale.
-  Listening broadly exposes the TCP port even though unlisted clients are rejected.
-- One TCP session per peer pair, with automatic reconnection and exponential
-  backoff (jittered, capped at 30 seconds). Both parties may attempt to connect;
-  the lexicographically smaller `(IPv4 string, listening port)` initiates the
-  surviving session. Both parties must permit inbound connections so this
-  deterministic rule can work regardless of which endpoint sorts first.
-- Online means a valid chat handshake was received. Heartbeats run every ten
-  seconds; no received data for thirty seconds closes a session. TCP closure is
-  detected sooner. The strip updates immediately; offline notices are delayed
-  two seconds to suppress brief leave/join noise. This is not perfect instantaneous
-  failure detection, and it is not Tailscale device presence.
-- Only currently online peers receive send attempts. There is **no offline queue,
-  reconnect replay, or application delivery acknowledgment**. TCP orders bytes
-  reliably within a live session, but cannot prove the remote app displayed them.
-  Your own message appears locally even if nobody is online; warnings identify
-  unavailable recipients and known failures. Data already handed to the OS can
-  still be lost when a connection fails, without a conclusive delivery result.
-- Messages are limited to 4,000 characters; nicknames to 32. Terminal control and
-  formatting characters are rejected on the wire and filtered from local display.
-  Frames and outgoing buffers are bounded; a slow peer cannot grow memory forever.
+Use Tailscale addresses: Lowtalk relies on Tailscale for encryption, not its own
+cryptography. If it cannot discover or bind the Tailscale address, it warns and
+listens on **all IPv4 interfaces**, still rejecting unlisted source IPs.
 
-The app never writes chat contents or drafts to disk. This does not prevent
-terminal recording, screenshots, OS swap/core dumps, or a peer saving messages.
-There is no independent security audit. Linux loopback/PTY tests are included;
-actual macOS/Tailscale interoperability still needs verification on those machines.
-
-## Maintenance and tests
-
-No installation or development dependencies are needed:
-
-```sh
-python3 -m unittest discover -s tests -v
-python3 -m compileall -q lowtalk.py chat_config.py chat_protocol.py chat_network.py chat_ui.py tests
-```
-
-Tests use local loopback sockets and a pseudo-terminal, not your live Tailscale
-peers. They cover configuration, protocol framing/validation, reconnects, duplicate
-connection arbitration, allowlist rejection, backpressure, heartbeat expiry,
-editing, and actual curses input during message receipt and terminal resize.
-
-Code map:
-
-- `lowtalk.py`: arguments, startup/bind policy, terminal lifecycle, cleanup.
-- `chat_config.py`: peer-file parsing, DNS resolution, optional CLI discovery.
-- `chat_protocol.py`: bounded JSON framing and input validation.
-- `chat_network.py`: selector-driven connection state and events.
-- `chat_ui.py`: editor, bounded scrollback, compact curses layout.
-
-One thread owns everything. Each UI iteration polls sockets and input with bounded
-work; there are no threads racing the terminal. DNS and CLI discovery happen only
-before curses starts. Connection state is explicit in `Peer` and `Connection`.
-Timing uses monotonic time; wall-clock time is only for displayed timestamps.
-
-### Wire protocol, version 1
-
-UTF-8 JSON objects, one per newline, at most 16,384 bytes excluding the newline.
-The first frame in each direction must be:
-
-```json
-{"type":"hello","version":1,"nick":"guest","port":7777}
-```
-
-The advertised listening port must match the recipient's peer-file entry.
-Subsequent frames are `{"type":"message","text":"hello"}`, `{"type":"ping"}`,
-or `{"type":"pong"}`. A ping gets a pong; a pong gets no reply. Bad framing,
-invalid fields, an unexpected hello, or a handshake exceeding five seconds closes
-the connection. Extra object fields are ignored. Outgoing buffers are capped at
-128 KiB per peer; overflow disconnects that peer and reports possible loss.
+The peer list trusts **machines, not individual users or processes**. Nicknames
+are self-chosen, not verified identities. Lowtalk does not save messages or drafts,
+but a participant or terminal recorder can.

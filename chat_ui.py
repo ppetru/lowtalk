@@ -1,6 +1,6 @@
 """Compact curses interface and a deliberately small readline-style editor."""
 
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime
 import time
@@ -14,6 +14,9 @@ from chat_protocol import MAX_MESSAGE, clean_text
 
 
 def cell_width(text: str) -> int:
+    # Code-point editing and approximate cell widths, not grapheme segmentation.
+    # Combining marks/East Asian widths cover ordinary text; complex emoji may
+    # differ from the terminal's rendering without changing the wire policy.
     return sum(0 if unicodedata.combining(c) else
                2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
 
@@ -52,10 +55,13 @@ class Editor:
     text: str = ""
     cursor: int = 0
     killed: str = ""
+    truncated: bool = False
 
     def insert(self, text: str) -> None:
         text = clean_text(text)
         available = MAX_MESSAGE - len(self.text)
+        # Sticky for this draft: editing afterwards cannot recover discarded text.
+        self.truncated |= len(text) > available
         text = text[:available]
         self.text = self.text[:self.cursor] + text + self.text[self.cursor:]
         self.cursor += len(text)
@@ -93,13 +99,16 @@ class Editor:
             self.kill(start, self.cursor)
         elif key == "\x19":
             self.insert(self.killed)
-        elif len(key) == 1 and key.isprintable():
+        elif len(key) == 1:
+            # Use the wire policy, not isprintable(), which varies with Python's
+            # Unicode version and rejects newer emoji on older interpreters.
             self.insert(key)
 
     def take(self) -> str:
         text = self.text
         self.text = ""
         self.cursor = 0
+        self.truncated = False
         return text
 
 
@@ -117,11 +126,17 @@ class ChatUI:
         self.unread = 0
         self.page_height = 1
         self.rendered: list[tuple[tuple[int, int], str]] = []
-        self.view_start = 0
+        self.view_start: tuple[int, int] | None = None
         self.layout_width = 0
-        self.layout_sequence = -1
+        # Wrap only the viewport and its immediate navigation targets. Retaining
+        # every wrapped row can cost hundreds of thousands of objects; rebuilding
+        # them on resize blocks this same thread's input and network processing.
+        self.wrapped: OrderedDict[int, list[str]] = OrderedDict()
 
     def event(self, sender: str, text: str) -> None:
+        if len(self.messages) == self.messages.maxlen:
+            self.wrapped.pop(self.messages[0][0], None)
+        # Local receipt/send-attempt time, never an untrusted sender timestamp.
         stamp = datetime.now().strftime("%H:%M")
         self.messages.append((self.sequence, f"{stamp} [{clean_text(sender)}] {clean_text(text)}"))
         self.sequence += 1
@@ -129,6 +144,7 @@ class ChatUI:
             self.unread += 1
 
     def _send(self) -> bool:
+        truncated = self.editor.truncated
         text = self.editor.take()
         if text == "/quit":
             return False
@@ -152,14 +168,64 @@ class ChatUI:
                 self.event("!", "Not queued for: " + ", ".join(unavailable))
             if not queued:
                 self.event("!", "No connected recipients; message was not sent.")
+        if truncated:
+            # A paste can include Enter before redraw. Put persistent feedback
+            # AFTER the long local echo so it stays visible in the live viewport.
+            self.event("!", f"Input truncated at {MAX_MESSAGE:,} characters; "
+                       "excess input was discarded.")
         return True
 
+    def _wrapped(self, seq: int) -> list[str]:
+        if seq not in self.wrapped:
+            message = self.messages[seq - self.messages[0][0]][1]
+            self.wrapped[seq] = wrap(message, self.layout_width - 1)
+            if len(self.wrapped) > 64:
+                self.wrapped.popitem(last=False)
+        self.wrapped.move_to_end(seq)
+        return self.wrapped[seq]
+
+    def _position(self, position: tuple[int, int]) -> tuple[int, int]:
+        seq, line = position
+        if seq < self.messages[0][0]:
+            return self.messages[0][0], 0  # The anchored message was evicted.
+        seq = min(seq, self.messages[-1][0])
+        return seq, min(line, len(self._wrapped(seq)) - 1)
+
+    def _move(self, position: tuple[int, int], rows: int) -> tuple[int, int]:
+        seq, line = self._position(position)
+        while rows < 0:
+            if -rows <= line:
+                return seq, line + rows
+            if seq == self.messages[0][0]:
+                return seq, 0
+            rows += line + 1
+            seq -= 1
+            line = len(self._wrapped(seq)) - 1
+        while rows > 0:
+            remaining = len(self._wrapped(seq)) - 1 - line
+            if rows <= remaining:
+                return seq, line + rows
+            if seq == self.messages[-1][0]:
+                return seq, line + remaining
+            rows -= remaining + 1
+            seq += 1
+            line = 0
+        return seq, line
+
+    def _bottom(self) -> tuple[int, int]:
+        seq = self.messages[-1][0]
+        return self._move((seq, len(self._wrapped(seq)) - 1), 1 - self.page_height)
+
     def _scroll(self, direction: int) -> None:
-        if not self.rendered:
+        if not self.messages or not self.layout_width:
             return
-        bottom = max(0, len(self.rendered) - self.page_height)
-        target = min(bottom, max(0, self.view_start + direction * self.page_height))
-        self.anchor = self.rendered[target][0] if target < bottom else None
+        bottom = self._bottom()
+        start = min(self._position(self.anchor), bottom) if self.anchor else bottom
+        target = min(bottom, self._move(start, direction * self.page_height))
+        # Update the navigation state now, not on redraw: multiple keys may be
+        # consumed in one input batch, and each must advance from the last one.
+        self.view_start = target
+        self.anchor = target if target < bottom else None
         if self.anchor is None:
             self.unread = 0
 
@@ -241,34 +307,32 @@ class ChatUI:
             put(row, line, curses.A_REVERSE)
         self.page_height = height - status_height - 2
         if self.layout_width != width:
-            self.rendered = []
-            self.layout_sequence = -1
+            self.wrapped.clear()
             self.layout_width = width
-        if self.messages and self.layout_sequence != self.messages[-1][0]:
-            oldest = self.messages[0][0]
-            self.rendered = [entry for entry in self.rendered if entry[0][0] >= oldest]
-            for seq, message in self.messages:
-                if seq > self.layout_sequence:
-                    self.rendered.extend(
-                        ((seq, index), line)
-                        for index, line in enumerate(wrap(message, width - 1))
-                    )
-            self.layout_sequence = self.messages[-1][0]
-        bottom = max(0, len(self.rendered) - self.page_height)
-        self.view_start = bottom
-        if self.anchor is not None:
-            self.view_start = next(
-                (i for i, (position, _) in enumerate(self.rendered) if position >= self.anchor),
-                bottom,
+        self.rendered = []
+        if self.messages:
+            bottom = self._bottom()
+            self.view_start = (
+                min(self._position(self.anchor), bottom) if self.anchor else bottom
             )
-            self.view_start = min(bottom, self.view_start)
-        for row, (_, line) in enumerate(
-                self.rendered[self.view_start:self.view_start + self.page_height]):
+            if self.anchor is not None:
+                self.anchor = self.view_start
+            seq, index = self.view_start
+            while seq <= self.messages[-1][0] and len(self.rendered) < self.page_height:
+                lines = self._wrapped(seq)
+                count = min(len(lines) - index, self.page_height - len(self.rendered))
+                self.rendered.extend(
+                    ((seq, i), lines[i]) for i in range(index, index + count)
+                )
+                seq, index = seq + 1, 0
+        for row, (_, line) in enumerate(self.rendered):
             put(status_height + row, line)
         hint = "PgUp/PgDn history | /who /quit | Ctrl-C quit"
         if self.anchor is not None:
             hint = f"History: {self.unread} new | PgDn to return | " + hint
-        put(height - 2, hint, curses.A_DIM)
+        if self.editor.truncated:
+            hint = f"Input truncated ({MAX_MESSAGE:,} max) | " + hint
+        put(height - 2, hint, curses.A_BOLD if self.editor.truncated else curses.A_DIM)
         prompt = clip(f"[{self.nick}] ", max(4, width // 3))
         room = width - 1 - cell_width(prompt)
         start = self.editor.cursor

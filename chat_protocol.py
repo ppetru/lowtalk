@@ -1,7 +1,15 @@
-"""Version-one wire format: bounded, newline-delimited UTF-8 JSON objects."""
+"""Version-one wire format: newline-delimited UTF-8 JSON objects.
 
+Frames are at most MAX_FRAME bytes, excluding the newline. Each direction starts
+with {"type":"hello","version":1,"nick":"guest","port":7777}; Network checks
+handshake order and the advertised port against its peer configuration. Later
+frames are {"type":"message","text":"hello"}, {"type":"ping"}, or {"type":"pong"}.
+Extra fields are ignored. Malformed framing or fields close the connection.
+"""
+
+from collections.abc import Iterator
 import json
-import unicodedata
+import re
 
 MAX_FRAME = 16_384
 MAX_MESSAGE = 4_000
@@ -12,9 +20,23 @@ class ProtocolError(ValueError):
     pass
 
 
+# Freeze the wire policy rather than using the interpreter's Unicode database:
+# a new emoji is "unassigned" on older Python, not a reason to disconnect it.
+# These are Unicode 16.0's Cc, Cf, and Cs ranges. Private-use and unassigned code
+# points are allowed. Changes to this table are protocol decisions, not automatic
+# Unicode upgrades; display widths may still differ between terminals.
+_UNSAFE_TEXT = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u00ad\u0600-\u0605\u061c\u06dd\u070f"
+    r"\u0890-\u0891\u08e2\u180e\u200b-\u200f\u202a-\u202e"
+    r"\u2060-\u2064\u2066-\u206f\ud800-\udfff\ufeff\ufff9-\ufffb"
+    r"\U000110bd\U000110cd\U00013430-\U0001343f\U0001bca0-\U0001bca3"
+    r"\U0001d173-\U0001d17a\U000e0001\U000e0020-\U000e007f]"
+)
+
+
 def clean_text(text: str) -> str:
     """Strip terminal controls, surrogate code points, and formatting controls."""
-    return "".join(char for char in text if not unicodedata.category(char).startswith("C"))
+    return _UNSAFE_TEXT.sub("", text)
 
 
 def valid_text(value: object, limit: int) -> bool:
@@ -56,9 +78,11 @@ class FrameReader:
     def __init__(self) -> None:
         self.buffer = bytearray()
 
-    def feed(self, data: bytes) -> list[dict]:
+    def feed(self, data: bytes) -> Iterator[dict]:
+        # Consume this iterator before feeding again (or abandon the connection).
+        # Yield valid frames before parsing the next: a bad suffix must not erase
+        # earlier messages just because TCP coalesced them into one recv().
         self.buffer.extend(data)
-        messages = []
         while True:
             end = self.buffer.find(b"\n")
             if end < 0:
@@ -69,5 +93,4 @@ class FrameReader:
                 raise ProtocolError("frame too large")
             frame = bytes(self.buffer[:end])
             del self.buffer[:end + 1]
-            messages.append(decode(frame))
-        return messages
+            yield decode(frame)

@@ -12,6 +12,11 @@ from chat_network import Network
 from chat_protocol import MAX_NICK, valid_text
 from chat_ui import ChatUI
 
+# Development uses only the standard library, from the repository root:
+#   python3 -m unittest discover -s tests -v
+#   python3 -m compileall -q lowtalk.py chat_*.py tests
+# Tests use loopback sockets and a PTY, never the local friends file or Tailscale.
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -34,6 +39,7 @@ def main() -> int:
 
     network = None
     try:
+        # DNS and optional CLI discovery may block; finish both before curses.
         peers = load_peers(Path.cwd() / "friends_tailscale_ips.txt")
         local_ip = tailscale_ip()
         if local_ip and any(

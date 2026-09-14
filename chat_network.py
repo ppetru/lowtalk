@@ -2,6 +2,12 @@
 
 No worker threads touch curses. Each tick does bounded socket work so a busy or
 slow peer cannot monopolize the input loop. Events are synchronous callbacks.
+All deadlines use monotonic time; wall-clock adjustments cannot alter them.
+
+Online means a valid hello, not Tailscale device presence. Any received bytes
+refresh the inactivity deadline. A ping gets a pong; pongs get no reply. Offline
+notices are debounced separately from the immediately updated connection status.
+There is no offline queue, reconnect replay, or application delivery receipt.
 """
 
 from dataclasses import dataclass, field
