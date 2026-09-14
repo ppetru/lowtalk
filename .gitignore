@@ -1,0 +1,6 @@
+# Private peer configuration: never commit real friends' addresses.
+friends_tailscale_ips.txt
+
+# Python bytecode and local caches.
+__pycache__/
+*.py[cod]
