@@ -10,6 +10,8 @@ notices are debounced separately from the immediately updated connection status.
 There is no offline queue, reconnect replay, or application delivery receipt.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 import errno
 import random

@@ -1,5 +1,7 @@
 """Peer-file parsing and best-effort local Tailscale address discovery."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 import ipaddress
 from pathlib import Path

@@ -1,7 +1,7 @@
 # Lowtalk
 
 Small, serverless terminal chat for trusted friends on Tailscale. Runs on Linux
-and macOS with Python 3.10+ and `curses`; no pip packages or chat server needed.
+and macOS with Python 3.9+ and `curses`; no pip packages or chat server needed.
 No saved chat logs.
 
 ## Run
