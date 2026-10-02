@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """Lowtalk: dependency-free, ephemeral terminal chat over Tailscale."""
 
+from __future__ import annotations
+
 import argparse
 import errno
 from pathlib import Path
 import signal
 import sys
+from types import FrameType
 
 from chat_config import DEFAULT_PORT, load_peers, parse_port, tailscale_ip
 from chat_network import Network
 from chat_protocol import MAX_NICK, valid_text
 from chat_ui import ChatUI
 
-# Development uses only the standard library, from the repository root:
+# Runtime and tests use only the standard library, from the repository root:
 #   python3 -m unittest discover -s tests -v
-#   python3 -m compileall -q lowtalk.py chat_*.py tests
+# Development-only static checks: pyright; ruff check .
 # Tests use loopback sockets and a PTY, never the local friends file or Tailscale.
+
+
+class Arguments(argparse.Namespace):
+    nick: str
+    port: int
 
 
 def main() -> int:
@@ -23,7 +31,7 @@ def main() -> int:
     parser.add_argument("nick", help="self-chosen nickname (up to 32 characters)")
     parser.add_argument("port", nargs="?", default=DEFAULT_PORT, type=parse_port,
                         help="local listening port (default: 7777)")
-    args = parser.parse_args()
+    args = parser.parse_args(namespace=Arguments())
     if not valid_text(args.nick, MAX_NICK):
         parser.error("nickname must be 1–32 characters, nonblank, without control characters")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -69,7 +77,7 @@ def main() -> int:
             ui.event("!", warning)
         ui.event("*", "TCP is not a display receipt. /who lists peers; /quit exits.")
 
-        def terminate(signum, frame):
+        def terminate(signum: int, frame: FrameType | None) -> None:
             raise KeyboardInterrupt
 
         previous = signal.signal(signal.SIGTERM, terminate)

@@ -1,20 +1,59 @@
-"""Version-one wire format: newline-delimited UTF-8 JSON objects.
+"""Version-two wire format: newline-delimited UTF-8 JSON objects.
 
 Frames are at most MAX_FRAME bytes, excluding the newline. Each direction starts
-with {"type":"hello","version":1,"nick":"guest","port":7777}; Network checks
-handshake order and the advertised port against its peer configuration. Later
-frames are {"type":"message","text":"hello"}, {"type":"ping"}, or {"type":"pong"}.
+with a hello carrying version, nickname, listening port, and a random process
+instance. The smaller instance coordinates select -> accept -> ready on one
+candidate socket. Only then may either side send message, ping, or pong frames.
 Extra fields are ignored. Malformed framing or fields close the connection.
 """
 
 from collections.abc import Iterator
 import json
 import re
+from typing import Literal, TypedDict, Union, cast
 
 MAX_FRAME = 16_384
 MAX_MESSAGE = 4_000
 MAX_NICK = 32
 
+
+
+class HelloFrame(TypedDict):
+    type: Literal["hello"]
+    version: Literal[2]
+    nick: str
+    port: int
+    instance: str
+
+
+class SelectFrame(TypedDict):
+    type: Literal["select"]
+
+
+class AcceptFrame(TypedDict):
+    type: Literal["accept"]
+
+
+class ReadyFrame(TypedDict):
+    type: Literal["ready"]
+
+
+class MessageFrame(TypedDict):
+    type: Literal["message"]
+    text: str
+
+
+class PingFrame(TypedDict):
+    type: Literal["ping"]
+
+
+class PongFrame(TypedDict):
+    type: Literal["pong"]
+
+
+Frame = Union[
+    HelloFrame, SelectFrame, AcceptFrame, ReadyFrame, MessageFrame, PingFrame, PongFrame
+]
 
 class ProtocolError(ValueError):
     pass
@@ -44,41 +83,63 @@ def valid_text(value: object, limit: int) -> bool:
             and len(value) <= limit and clean_text(value) == value)
 
 
-def encode(message: dict) -> bytes:
+def encode(message: Frame) -> bytes:
     data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(data) > MAX_FRAME:
         raise ProtocolError("message exceeds wire-size limit")
     return data + b"\n"
 
 
-def decode(data: bytes) -> dict:
+def decode(data: bytes) -> Frame:
     try:
-        message = json.loads(data.decode("utf-8"))
+        raw: object = json.loads(data.decode("utf-8"))
     except (ValueError, UnicodeError, RecursionError) as exc:
         raise ProtocolError("invalid JSON frame") from exc
-    if not isinstance(message, dict):
+    if not isinstance(raw, dict):
         raise ProtocolError("expected an object")
+    # JSON object keys are strings. Values remain untrusted objects until the
+    # checks below; construct fresh typed frames rather than trusting raw fields.
+    message = cast(dict[str, object], raw)
     kind = message.get("type")
     if kind == "hello":
-        port = message.get("port")
         version = message.get("version")
-        if (type(version) is not int or version != 1
-                or not valid_text(message.get("nick"), MAX_NICK)
-                or type(port) is not int or not 1 <= port <= 65535):
+        if type(version) is not int:
+            raise ProtocolError("invalid hello version")
+        if version != 2:
+            raise ProtocolError(f"unsupported protocol version {version}; expected 2")
+        port = message.get("port")
+        nick = message.get("nick")
+        instance = message.get("instance")
+        if (type(port) is not int or not 1 <= port <= 65535
+                or not isinstance(nick, str) or not valid_text(nick, MAX_NICK)
+                or not isinstance(instance, str)
+                or re.fullmatch(r"[0-9a-f]{32}", instance) is None):
             raise ProtocolError("invalid hello")
-    elif kind == "message":
-        if not valid_text(message.get("text"), MAX_MESSAGE):
+        return {"type": "hello", "version": 2, "nick": nick,
+                "port": port, "instance": instance}
+    if kind == "message":
+        text = message.get("text")
+        if not isinstance(text, str) or not valid_text(text, MAX_MESSAGE):
             raise ProtocolError("invalid message text")
-    elif kind not in ("ping", "pong"):
-        raise ProtocolError("unknown message type")
-    return message
+        return {"type": "message", "text": text}
+    if kind == "select":
+        return {"type": "select"}
+    if kind == "accept":
+        return {"type": "accept"}
+    if kind == "ready":
+        return {"type": "ready"}
+    if kind == "ping":
+        return {"type": "ping"}
+    if kind == "pong":
+        return {"type": "pong"}
+    raise ProtocolError("unknown message type")
 
 
 class FrameReader:
     def __init__(self) -> None:
         self.buffer = bytearray()
 
-    def feed(self, data: bytes) -> Iterator[dict]:
+    def feed(self, data: bytes) -> Iterator[Frame]:
         # Consume this iterator before feeding again (or abandon the connection).
         # Yield valid frames before parsing the next: a bad suffix must not erase
         # earlier messages just because TCP coalesced them into one recv().

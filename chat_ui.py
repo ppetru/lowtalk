@@ -1,13 +1,16 @@
 """Compact curses interface and a deliberately small readline-style editor."""
 
+from __future__ import annotations
+
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime
 import time
 import unicodedata
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
+    import curses
     from chat_network import Network
 
 from chat_protocol import MAX_MESSAGE, clean_text
@@ -22,7 +25,7 @@ def cell_width(text: str) -> int:
 
 
 def clip(text: str, width: int) -> str:
-    result = []
+    result: list[str] = []
     used = 0
     for char in text:
         size = cell_width(char)
@@ -36,7 +39,7 @@ def clip(text: str, width: int) -> str:
 def wrap(text: str, width: int) -> list[str]:
     """Wrap by terminal cells, including wide characters, without losing spaces."""
     width = max(2, width)
-    lines = []
+    lines: list[str] = []
     line = ""
     used = 0
     for char in text:
@@ -122,11 +125,11 @@ class ChatUI:
         self.sequence = 0
         # Anchor by message and wrapped-line index, not distance from the end.
         # Incoming messages therefore don't move the currently viewed content.
-        self.anchor: tuple[int, int] | None = None
+        self.anchor: Optional[tuple[int, int]] = None
         self.unread = 0
         self.page_height = 1
         self.rendered: list[tuple[tuple[int, int], str]] = []
-        self.view_start: tuple[int, int] | None = None
+        self.view_start: Optional[tuple[int, int]] = None
         self.layout_width = 0
         # Wrap only the viewport and its immediate navigation targets. Retaining
         # every wrapped row can cost hundreds of thousands of objects; rebuilding
@@ -138,15 +141,19 @@ class ChatUI:
             self.wrapped.pop(self.messages[0][0], None)
         # Local receipt/send-attempt time, never an untrusted sender timestamp.
         stamp = datetime.now().strftime("%H:%M")
-        self.messages.append((self.sequence, f"{stamp} [{clean_text(sender)}] {clean_text(text)}"))
+        text = clean_text(text)
+        line = (f"{stamp} --- {text} ---" if sender == "---"
+                else f"{stamp} [{clean_text(sender)}] {text}")
+        self.messages.append((self.sequence, line))
         self.sequence += 1
         if self.anchor is not None:
             self.unread += 1
 
     def _send(self) -> bool:
         truncated = self.editor.truncated
-        text = self.editor.take()
+        text = self.editor.text
         if text == "/quit":
+            self.editor.take()
             return False
         if text == "/who":
             for peer in self.network.peers:
@@ -156,18 +163,22 @@ class ChatUI:
                 )
                 detail = f"; last error: {peer.last_error}" if peer.last_error else ""
                 self.event("*", f"{peer.nick or peer.config.label} @ {address}: "
-                           f"{peer.status} (port {peer.config.port}){detail}")
+                           f"{peer.display_status} (port {peer.config.port}){detail}")
         elif text.startswith("/") and not text.startswith("//"):
             self.event("!", "Commands: /who, /quit. Use // to send a leading slash.")
         elif text.strip():
-            if text.startswith("//"):
-                text = text[1:]
-            queued, unavailable = self.network.broadcast(text)
-            self.event(f"{self.nick} (you)", text)
+            payload = text[1:] if text.startswith("//") else text
+            queued, unavailable = self.network.broadcast(payload)
+            if not queued:
+                self.event("!", "Not sent: no recipients queued. "
+                           "Draft kept; press Enter to retry.")
+                if unavailable:
+                    self.event("!", "Not queued for: " + ", ".join(unavailable))
+                return True
+            self.event(f"{self.nick} (you)", payload)
             if unavailable:
                 self.event("!", "Not queued for: " + ", ".join(unavailable))
-            if not queued:
-                self.event("!", "No connected recipients; message was not sent.")
+        self.editor.take()
         if truncated:
             # A paste can include Enter before redraw. Put persistent feedback
             # AFTER the long local echo so it stays visible in the live viewport.
@@ -229,7 +240,7 @@ class ChatUI:
         if self.anchor is None:
             self.unread = 0
 
-    def run(self, screen) -> None:
+    def run(self, screen: curses.window) -> None:
         import curses
 
         curses.raw()  # Handle Ctrl-C ourselves; Ctrl-S/Q must not freeze the UI.
@@ -268,14 +279,14 @@ class ChatUI:
                     self._scroll(1)
                 elif key == "\x0c":
                     screen.clearok(True)
-                elif key in keys:
+                elif isinstance(key, int) and key in keys:
                     self.editor.key(keys[key])
                 elif isinstance(key, str):
                     self.editor.key(key)
             self.draw(screen)
             time.sleep(0.03)
 
-    def draw(self, screen) -> None:
+    def draw(self, screen: curses.window) -> None:
         import curses
 
         height, width = screen.getmaxyx()
@@ -294,7 +305,7 @@ class ChatUI:
             return
 
         friends = " | ".join(
-            f"{peer.nick or peer.config.label}: {peer.status}"
+            f"{peer.nick or peer.config.label}: {peer.display_status}"
             for peer in self.network.peers
         )
         # At most two rows: the common one-friend case costs just one row.

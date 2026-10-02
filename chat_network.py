@@ -4,24 +4,27 @@ No worker threads touch curses. Each tick does bounded socket work so a busy or
 slow peer cannot monopolize the input loop. Events are synchronous callbacks.
 All deadlines use monotonic time; wall-clock adjustments cannot alter them.
 
-Online means a valid hello, not Tailscale device presence. Any received bytes
-refresh the inactivity deadline. A ping gets a pong; pongs get no reply. Routine
-connection changes update status without adding events to conversation history.
-There is no offline queue, reconnect replay, or application delivery receipt.
+Online means a committed protocol-v2 handshake, not Tailscale device presence.
+The smaller process instance selects the first valid candidate in either socket
+direction. Routine connection changes are quiet; only a newly committed remote
+instance adds a history boundary. There is no offline queue or delivery receipt.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum, auto
 import errno
+import math
 import random
+import secrets
 import selectors
 import socket
 import time
-from typing import Callable
+from typing import Callable, NoReturn, Optional, cast
 
 from chat_config import PeerConfig
-from chat_protocol import FrameReader, ProtocolError, encode
+from chat_protocol import Frame, FrameReader, ProtocolError, encode
 
 CONNECT_TIMEOUT = 5.0
 HEARTBEAT_INTERVAL = 10.0
@@ -29,11 +32,26 @@ DEAD_TIMEOUT = 30.0
 MAX_PENDING = 128 * 1024
 
 
+def _unreachable(value: NoReturn) -> NoReturn:
+    raise AssertionError(f"unhandled state or frame: {value!r}")
+
+
+class Phase(Enum):
+    CONNECTING = auto()
+    HELLO = auto()
+    CANDIDATE = auto()
+    SELECTED = auto()
+    ACCEPTED = auto()
+    READY = auto()
+
+
 @dataclass
 class Peer:
     config: PeerConfig
-    connection: "Connection | None" = None
+    connection: Optional[Connection] = None
+    candidates: dict[bool, Connection] = field(default_factory=lambda: dict[bool, Connection]())
     nick: str = ""
+    last_instance: Optional[str] = None
     retry_at: float = 0.0
     backoff: float = 1.0
     address_index: int = 0
@@ -41,9 +59,17 @@ class Peer:
 
     @property
     def status(self) -> str:
-        if self.connection is None:
-            return "offline"
-        return "online" if self.connection.ready else "connecting"
+        if self.connection is not None and self.connection.ready:
+            return "online"
+        return "connecting" if self.candidates else "offline"
+
+    @property
+    def display_status(self) -> str:
+        status = self.status
+        remaining = self.retry_at - time.monotonic()
+        if status == "offline" and remaining > 0 and math.isfinite(remaining):
+            return f"offline (retry in {math.ceil(remaining)}s)"
+        return status
 
 
 @dataclass
@@ -53,12 +79,17 @@ class Connection:
     address: str
     outgoing: bool
     created: float
-    connecting: bool = False
-    ready: bool = False
+    phase: Phase = Phase.HELLO
+    remote_instance: Optional[str] = None
+    remote_nick: str = ""
     reader: FrameReader = field(default_factory=FrameReader)
     output: bytearray = field(default_factory=bytearray)
     last_received: float = 0.0
     last_ping: float = 0.0
+
+    @property
+    def ready(self) -> bool:
+        return self.phase is Phase.READY
 
 
 class Network:
@@ -70,6 +101,7 @@ class Network:
         self.port = port
         self.bind_ip = bind_ip
         self.on_event = on_event
+        self.instance = secrets.token_hex(16)
         self.peers = [Peer(config) for config in peers]
         self.allowed = {ip: peer for peer in self.peers for ip in peer.config.addresses}
         self.selector = selectors.DefaultSelector()
@@ -87,20 +119,25 @@ class Network:
             raise
 
     def close(self) -> None:
-        for sock in list(self.connections):
-            self.selector.unregister(sock)
-            sock.close()
-        self.connections.clear()
+        for conn in list(self.connections.values()):
+            self._retire(conn)
         self.listener.close()
         self.selector.close()
 
+    def _active(self, conn: Connection) -> bool:
+        return self.connections.get(conn.sock) is conn
+
     def _interest(self, conn: Connection) -> None:
+        if not self._active(conn):
+            return
         events = selectors.EVENT_READ
-        if conn.connecting or conn.output:
+        if conn.phase is Phase.CONNECTING or conn.output:
             events |= selectors.EVENT_WRITE
         self.selector.modify(conn.sock, events, conn)
 
-    def _queue(self, conn: Connection, message: dict) -> bool:
+    def _queue(self, conn: Connection, message: Frame) -> bool:
+        if not self._active(conn):
+            return False
         data = encode(message)
         if len(conn.output) + len(data) > MAX_PENDING:
             self._drop(conn, "outgoing buffer full; pending messages may be lost", warn=True)
@@ -111,30 +148,24 @@ class Network:
 
     def _register(self, sock: socket.socket, peer: Peer, address: str,
                   outgoing: bool, connecting: bool = False) -> None:
-        # Both sides may dial. Only the lexicographically smaller listening
-        # endpoint's outbound connection survives, so there is no split-brain
-        # choice of two different sockets. TCP source ports are ephemeral.
-        local_endpoint = (sock.getsockname()[0], self.port)
-        remote_endpoint = (address, peer.config.port)
-        want_outgoing = local_endpoint < remote_endpoint
-        if local_endpoint == remote_endpoint or outgoing != want_outgoing:
-            sock.close()
-            return
-        if peer.connection is not None:
+        # A selection is irrevocable. Before selection retain at most one socket
+        # in each direction, allowing either side to start the conversation.
+        if peer.connection is not None or outgoing in peer.candidates:
             sock.close()
             return
         now = time.monotonic()
         conn = Connection(
             sock=sock, peer=peer, address=address, outgoing=outgoing,
-            created=now, connecting=connecting, last_received=now, last_ping=now,
+            created=now, phase=Phase.CONNECTING if connecting else Phase.HELLO,
+            last_received=now, last_ping=now,
         )
         sock.setblocking(False)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.selector.register(sock, selectors.EVENT_READ, conn)
         self.connections[sock] = conn
-        peer.connection = conn
-        self._queue(conn, {"type": "hello", "version": 1,
-                           "nick": self.nick, "port": self.port})
+        peer.candidates[outgoing] = conn
+        self._queue(conn, {"type": "hello", "version": 2,
+                           "nick": self.nick, "port": self.port, "instance": self.instance})
 
     def _retry(self, peer: Peer, now: float) -> None:
         delay = min(30.0, peer.backoff + random.uniform(0, peer.backoff / 4))
@@ -177,48 +208,128 @@ class Network:
             except OSError:
                 sock.close()
 
-    def _drop(self, conn: Connection, reason: str, *, warn: bool = False) -> None:
-        if conn.sock not in self.connections:
+    def _retire(self, conn: Connection) -> None:
+        if not self._active(conn):
             return
         self.selector.unregister(conn.sock)
         del self.connections[conn.sock]
         conn.sock.close()
         peer = conn.peer
-        peer.connection = None
-        peer.last_error = reason
-        now = time.monotonic()
-        self._retry(peer, now)
-        if conn.ready:
-            if conn.output:
-                self.on_event("!", f"{peer.config.label}: connection lost with pending data; "
-                              "some messages may not have arrived")
-            if warn:
-                self.on_event("!", f"{peer.config.label}: {reason}")
+        assert peer.candidates.get(conn.outgoing) is conn
+        del peer.candidates[conn.outgoing]
+        if peer.connection is conn:
+            peer.connection = None
 
-    def _message(self, conn: Connection, message: dict) -> None:
-        kind = message["type"]
-        if not conn.ready:
-            if kind != "hello" or message["port"] != conn.peer.config.port:
+    def _drop(self, conn: Connection, reason: str, *, warn: bool = False) -> None:
+        if not self._active(conn):
+            return
+        was_ready = conn.ready
+        had_pending = bool(conn.output)
+        peer = conn.peer
+        self._retire(conn)
+        if not peer.candidates:
+            peer.last_error = reason
+            self._retry(peer, time.monotonic())
+        if was_ready and had_pending:
+            self.on_event("!", f"{peer.config.label}: connection lost with pending data; "
+                          "some messages may not have arrived")
+        if warn and was_ready:
+            self.on_event("!", f"{peer.config.label}: {reason}")
+
+    def _choose(self, conn: Connection, phase: Phase) -> None:
+        peer = conn.peer
+        assert self._active(conn) and conn.phase is Phase.CANDIDATE
+        assert peer.connection is None and conn.remote_instance is not None
+        assert phase in (Phase.SELECTED, Phase.ACCEPTED)
+        peer.connection = conn
+        conn.phase = phase
+        other = peer.candidates.get(not conn.outgoing)
+        if other is not None:
+            self._retire(other)
+        assert len(peer.candidates) == 1 and peer.candidates[conn.outgoing] is conn
+
+    def _commit(self, conn: Connection) -> None:
+        peer = conn.peer
+        instance = conn.remote_instance
+        assert self._active(conn) and peer.connection is conn
+        assert conn.phase in (Phase.SELECTED, Phase.ACCEPTED)
+        assert instance is not None and len(peer.candidates) == 1
+        previous = peer.last_instance
+        conn.phase = Phase.READY
+        peer.last_instance = instance
+        peer.nick = conn.remote_nick
+        peer.last_error = ""
+        peer.backoff = 1.0
+        if previous is not None and previous != instance:
+            self.on_event("---", f"{peer.nick} has a new Lowtalk session; "
+                          "previous scrollback was cleared.")
+
+    def _message(self, conn: Connection, message: Frame) -> None:
+        phase = conn.phase
+        if phase is Phase.HELLO:
+            if message["type"] != "hello" or message["port"] != conn.peer.config.port:
                 raise ProtocolError("expected hello with configured listening port")
-            conn.ready = True
-            peer = conn.peer
-            peer.nick = message["nick"]
-            peer.last_error = ""
-            peer.backoff = 1.0
-        elif kind == "hello":
-            raise ProtocolError("duplicate hello")
-        elif kind == "message":
+            if message["instance"] == self.instance:
+                raise ProtocolError("remote process instance matches local instance")
+            conn.remote_instance = message["instance"]
+            conn.remote_nick = message["nick"]
+            conn.phase = Phase.CANDIDATE
+            if self.instance < message["instance"]:
+                self._choose(conn, Phase.SELECTED)
+                self._queue(conn, {"type": "select"})
+            return
+        if phase is Phase.CANDIDATE:
+            if message["type"] != "select":
+                raise ProtocolError("expected select before application frames")
+            assert conn.remote_instance is not None
+            if conn.remote_instance >= self.instance:
+                raise ProtocolError("only the smaller process instance may select")
+            self._choose(conn, Phase.ACCEPTED)
+            self._queue(conn, {"type": "accept"})
+            return
+        if phase is Phase.SELECTED:
+            if message["type"] != "accept":
+                raise ProtocolError("expected accept before application frames")
+            if self._queue(conn, {"type": "ready"}):
+                # ready precedes all application output on this TCP stream. The
+                # follower is already locked to this socket by its accept.
+                self._commit(conn)
+            return
+        if phase is Phase.ACCEPTED:
+            if message["type"] != "ready":
+                raise ProtocolError("expected ready before application frames")
+            self._commit(conn)
+            return
+        if phase is Phase.CONNECTING:
+            raise ProtocolError("expected completed TCP connection before frames")
+        if phase is not Phase.READY:
+            _unreachable(phase)
+        if message["type"] == "message":
             self.on_event(f"{conn.peer.nick} @ {conn.address}", message["text"])
-        elif kind == "ping":
+        elif message["type"] == "ping":
             self._queue(conn, {"type": "pong"})
+        elif message["type"] == "pong":
+            pass
+        elif (message["type"] == "hello" or message["type"] == "select"
+              or message["type"] == "accept" or message["type"] == "ready"):
+            raise ProtocolError("unexpected handshake frame after ready")
+        else:
+            _unreachable(message)
 
     def _service(self, conn: Connection, mask: int, now: float) -> None:
+        # select() returns a snapshot: choosing another socket may already have
+        # retired this entry, including its file descriptor, earlier this tick.
+        if not self._active(conn):
+            return
+        if not conn.ready and now - conn.created >= CONNECT_TIMEOUT:
+            self._drop(conn, "handshake timed out")
+            return
         try:
-            if conn.connecting:
+            if conn.phase is Phase.CONNECTING:
                 error = conn.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
                 if error:
                     raise OSError(error, "connect failed")
-                conn.connecting = False
+                conn.phase = Phase.HELLO
             if mask & selectors.EVENT_READ:
                 data = conn.sock.recv(16_384)
                 if not data:
@@ -227,7 +338,7 @@ class Network:
                 conn.last_received = now
                 for message in conn.reader.feed(data):
                     self._message(conn, message)
-                    if conn.sock not in self.connections:
+                    if not self._active(conn):
                         return
             if mask & selectors.EVENT_WRITE and conn.output:
                 sent = conn.sock.send(conn.output)
@@ -246,9 +357,9 @@ class Network:
             if key.fileobj is self.listener:
                 self._accept()
             else:
-                self._service(key.data, mask, now)
+                self._service(cast(Connection, key.data), mask, now)
         for conn in list(self.connections.values()):
-            if not conn.ready and now - conn.created > CONNECT_TIMEOUT:
+            if not conn.ready and now - conn.created >= CONNECT_TIMEOUT:
                 self._drop(conn, "handshake timed out")
             elif now - conn.last_received > DEAD_TIMEOUT:
                 self._drop(conn, "heartbeat timed out")
@@ -256,12 +367,14 @@ class Network:
                 conn.last_ping = now
                 self._queue(conn, {"type": "ping"})
         for peer in self.peers:
-            if peer.connection is None and now >= peer.retry_at:
+            if (peer.connection is None and True not in peer.candidates
+                    and now >= peer.retry_at):
                 self._dial(peer, now)
 
     def broadcast(self, text: str) -> tuple[list[str], list[str]]:
-        """Queue only for live sessions. Success is NOT a display receipt."""
-        queued, unavailable = [], []
+        """Queue only for committed sessions. Success is NOT a display receipt."""
+        queued: list[str] = []
+        unavailable: list[str] = []
         for peer in self.peers:
             conn = peer.connection
             if conn is not None and conn.ready and self._queue(

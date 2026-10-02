@@ -1,0 +1,11 @@
+[tool.pyright]
+include = ["lowtalk.py", "chat_config.py", "chat_network.py", "chat_protocol.py", "chat_ui.py"]
+pythonVersion = "3.9"
+pythonPlatform = "All"
+typeCheckingMode = "strict"
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

@@ -7,6 +7,7 @@ import ipaddress
 from pathlib import Path
 import socket
 import subprocess
+from typing import cast
 
 DEFAULT_PORT = 7777
 
@@ -34,7 +35,7 @@ def parse_port(value: str) -> int:
 
 def load_peers(path: Path) -> list[PeerConfig]:
     """Resolve once at startup. Ambiguous address membership is an error."""
-    peers = []
+    peers: list[PeerConfig] = []
     owners: dict[str, str] = {}
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         fields = line.partition("#")[0].split()
@@ -46,7 +47,10 @@ def load_peers(path: Path) -> list[PeerConfig]:
             host = fields[0]
             port = parse_port(fields[1]) if len(fields) == 2 else DEFAULT_PORT
             results = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-            addresses = tuple(sorted({result[4][0] for result in results}))
+            # AF_INET guarantees an IPv4 (host, port) sockaddr; typeshed also
+            # covers other families whose sockaddr has a different shape.
+            addresses = tuple(sorted({cast(tuple[str, int], result[4])[0]
+                                      for result in results}))
             for address in addresses:
                 if address in owners:
                     raise ValueError(f"{host} overlaps with {owners[address]} at {address}")
