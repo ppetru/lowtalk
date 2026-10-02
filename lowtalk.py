@@ -82,7 +82,10 @@ def main() -> int:
 
         previous = signal.signal(signal.SIGTERM, terminate)
         try:
-            curses.wrapper(ui.run)
+            discarded = curses.wrapper(ui.run)
+            if discarded:
+                print("Warning: unsent messages discarded on exit for: "
+                      + ", ".join(discarded), file=sys.stderr)
         finally:
             signal.signal(signal.SIGTERM, previous)
     except KeyboardInterrupt:

@@ -25,7 +25,7 @@ class StartupTests(unittest.TestCase):
             patch("lowtalk.tailscale_ip", return_value="100.64.0.1")
         )
         self.factory = self.stack.enter_context(patch("lowtalk.Network"))
-        self.wrapper = self.stack.enter_context(patch("curses.wrapper"))
+        self.wrapper = self.stack.enter_context(patch("curses.wrapper", return_value=[]))
         self.ui = self.stack.enter_context(patch("lowtalk.ChatUI")).return_value
         self.stderr = self.stack.enter_context(patch("sys.stderr", new_callable=io.StringIO))
 
@@ -54,6 +54,13 @@ class StartupTests(unittest.TestCase):
         self.assertTrue(any("not bindable" in call.args[1]
                             for call in self.ui.event.call_args_list))
         fallback.close.assert_called_once()
+
+    def test_shutdown_discard_warning_is_printed_after_curses_returns(self):
+        self.factory.return_value.bind_ip = "100.64.0.1"
+        self.wrapper.return_value = ["friend"]
+        self.assertEqual(lowtalk.main(), 0)
+        self.assertIn("unsent messages discarded on exit for: friend", self.stderr.getvalue())
+        self.factory.return_value.close.assert_called_once()
 
     def test_occupied_port_never_falls_back(self):
         self.factory.side_effect = OSError(errno.EADDRINUSE, "occupied")

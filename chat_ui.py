@@ -240,7 +240,7 @@ class ChatUI:
         if self.anchor is None:
             self.unread = 0
 
-    def run(self, screen: curses.window) -> None:
+    def run(self, screen: curses.window) -> list[str]:
         import curses
 
         curses.raw()  # Handle Ctrl-C ourselves; Ctrl-S/Q must not freeze the UI.
@@ -285,6 +285,7 @@ class ChatUI:
                     self.editor.key(key)
             self.draw(screen)
             time.sleep(0.03)
+        return self.network.flush()
 
     def draw(self, screen: curses.window) -> None:
         import curses

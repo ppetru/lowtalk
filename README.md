@@ -59,7 +59,10 @@ warnings to scrollback.
   receipts either.
 - Page Up / Page Down browse the last **1,000 in-memory entries**, with an unread
   count while browsing. Page down to the bottom to return to live messages.
-- `/quit` or Ctrl-C exits. `//text` sends a literal leading `/text`.
+- `/quit` or Ctrl-C exits after allowing up to one second to flush existing
+  connections, without reconnecting or replaying messages. Unsent chat discarded
+  during this flush is reported after the terminal is restored. External signals
+  may interrupt this best-effort flush. `//text` sends a literal leading `/text`.
 - Messages are limited to **4,000 characters**. Excess input is discarded with a
   warning. **Pasted newlines send messages**, just like Enter.
 

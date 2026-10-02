@@ -12,6 +12,7 @@ instance adds a history boundary. There is no offline queue or delivery receipt.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import errno
@@ -30,6 +31,15 @@ CONNECT_TIMEOUT = 5.0
 HEARTBEAT_INTERVAL = 10.0
 DEAD_TIMEOUT = 30.0
 MAX_PENDING = 128 * 1024
+SHUTDOWN_TIMEOUT = 1.0
+# Linux may return pending network errors from accept(); macOS also reports
+# aborted connections. Retry only these transient errors, not broken listeners.
+_RETRYABLE_ACCEPT_ERRORS = {
+    getattr(errno, name) for name in (
+        "ECONNABORTED", "EINTR", "ENETDOWN", "EPROTO", "ENOPROTOOPT",
+        "EHOSTDOWN", "ENONET", "EHOSTUNREACH", "EOPNOTSUPP", "ENETUNREACH",
+    ) if hasattr(errno, name)
+}
 
 
 def _unreachable(value: NoReturn) -> NoReturn:
@@ -84,6 +94,8 @@ class Connection:
     remote_nick: str = ""
     reader: FrameReader = field(default_factory=FrameReader)
     output: bytearray = field(default_factory=bytearray)
+    # End offsets of application frames in output; protocol frames do not count.
+    pending_messages: deque[int] = field(default_factory=lambda: deque[int]())
     last_received: float = 0.0
     last_ping: float = 0.0
 
@@ -124,6 +136,32 @@ class Network:
         self.listener.close()
         self.selector.close()
 
+    def flush(self, timeout: float = SHUTDOWN_TIMEOUT) -> list[str]:
+        """Boundedly drain committed sockets, without dialing or heartbeats.
+
+        Return peers whose application data remains at the deadline or was
+        discarded on failure. Failures also use the ordinary warning callback.
+        Sending to TCP is still not a delivery receipt.
+        """
+        deadline = time.monotonic() + timeout
+        discarded: set[str] = set()
+        while any(conn.ready and conn.output for conn in self.connections.values()):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            for key, mask in self.selector.select(timeout=min(remaining, 0.05)):
+                if key.fileobj is self.listener:
+                    continue
+                conn = cast(Connection, key.data)
+                if conn.ready:
+                    had_pending = bool(conn.pending_messages)
+                    self._service(conn, mask, time.monotonic())
+                    if had_pending and not self._active(conn):
+                        discarded.add(conn.peer.config.label)
+        discarded.update(conn.peer.config.label for conn in self.connections.values()
+                         if conn.pending_messages)
+        return sorted(discarded)
+
     def _active(self, conn: Connection) -> bool:
         return self.connections.get(conn.sock) is conn
 
@@ -143,6 +181,8 @@ class Network:
             self._drop(conn, "outgoing buffer full; pending messages may be lost", warn=True)
             return False
         conn.output.extend(data)
+        if message["type"] == "message":
+            conn.pending_messages.append(len(conn.output))
         self._interest(conn)
         return True
 
@@ -198,6 +238,10 @@ class Network:
                 sock, (address, _) = self.listener.accept()
             except BlockingIOError:
                 return
+            except OSError as exc:
+                if exc.errno in _RETRYABLE_ACCEPT_ERRORS:
+                    continue
+                raise
             peer = self.allowed.get(address)
             if peer is None:
                 # Do not even send a hello to an unlisted source address.
@@ -224,7 +268,7 @@ class Network:
         if not self._active(conn):
             return
         was_ready = conn.ready
-        had_pending = bool(conn.output)
+        had_pending = bool(conn.pending_messages)
         peer = conn.peer
         self._retire(conn)
         if not peer.candidates:
@@ -343,6 +387,9 @@ class Network:
             if mask & selectors.EVENT_WRITE and conn.output:
                 sent = conn.sock.send(conn.output)
                 del conn.output[:sent]
+                conn.pending_messages = deque(
+                    end - sent for end in conn.pending_messages if end > sent
+                )
             self._interest(conn)
         except BlockingIOError:
             pass

@@ -763,7 +763,7 @@ class NetworkTests(unittest.TestCase):
     def test_timeout_with_pending_data_warns(self):
         a, _, events, _ = self.pair()
         conn = a.peers[0].connection
-        conn.output.extend(b"pending")
+        a.broadcast("pending")
         a._drop(conn, "heartbeat timed out")
         self.assertEqual(a.peers[0].status, "offline")
         self.assertTrue(any("some messages may not have arrived" in text
@@ -849,6 +849,134 @@ class NetworkTests(unittest.TestCase):
                 self.assertEqual(a.peers[0].backoff, 1)
         self.assertEqual(events, [
             ("---", "bob has a new Lowtalk session; previous scrollback was cleared.")] * 3)
+
+    def test_accept_retries_aborted_connection_without_harming_live_peer(self):
+        a, b, events, _ = self.pair()
+        chosen = a.peers[0].connection
+        listener = Mock()
+        listener.accept.side_effect = [
+            ConnectionAbortedError(errno.ECONNABORTED, "aborted"), BlockingIOError(),
+        ]
+        with patch.object(a, "listener", listener):
+            a._accept()
+        self.assertEqual(listener.accept.call_count, 2)
+        self.assertIs(a.peers[0].connection, chosen)
+        b.broadcast("still live")
+        pump([a, b], lambda: bool(events))
+        self.assertEqual([text for _, text in events], ["still live"])
+
+    def test_accept_can_register_after_abort_and_retries_are_bounded(self):
+        network = self.create("me", free_port(), [peer(7777)], [])
+        network.peers[0].retry_at = float("inf")
+        with socket.create_connection(("127.0.0.1", network.port)):
+            listener = Mock()
+            listener.accept.side_effect = [
+                ConnectionAbortedError(errno.ECONNABORTED, "aborted"),
+                network.listener.accept(), BlockingIOError(),
+            ]
+            with patch.object(network, "listener", listener):
+                network._accept()
+            self.assertIn(False, network.peers[0].candidates)
+        listener.accept.side_effect = ConnectionAbortedError(errno.ECONNABORTED, "aborted")
+        listener.accept.reset_mock()
+        with patch.object(network, "listener", listener):
+            network._accept()
+        self.assertEqual(listener.accept.call_count, 8)
+        listener.accept.side_effect = OSError(errno.EBADF, "broken listener")
+        with patch.object(network, "listener", listener), self.assertRaises(OSError):
+            network._accept()
+
+    def test_protocol_only_disconnect_is_quiet(self):
+        a, _, events, _ = self.pair()
+        conn = a.peers[0].connection
+        a._queue(conn, {"type": "ping"})
+        a._queue(conn, {"type": "pong"})
+        self.assertTrue(conn.output)
+        self.assertFalse(conn.pending_messages)
+        a._drop(conn, "connection closed")
+        self.assertEqual(events, [])
+
+    def test_pending_chat_tracking_handles_short_writes_and_would_block(self):
+        a, _, events, _ = self.pair()
+        conn = a.peers[0].connection
+        a._queue(conn, {"type": "ping"})
+        prefix = len(conn.output)
+        a.broadcast("first")
+        first_end = len(conn.output)
+        a._queue(conn, {"type": "pong"})
+        a.broadcast("second")
+        second_end = len(conn.output)
+        a._queue(conn, {"type": "ping"})
+        sock = Mock()
+        sock.send.side_effect = [BlockingIOError(), prefix + 1,
+                                 first_end - prefix - 1, second_end - first_end]
+        with patch.object(conn, "sock", sock), \
+                patch.object(a, "_active", return_value=True), patch.object(a, "_interest"):
+            for expected in ([first_end, second_end],
+                             [first_end - prefix - 1, second_end - prefix - 1],
+                             [second_end - first_end], []):
+                a._service(conn, selectors.EVENT_WRITE, time.monotonic())
+                self.assertEqual(list(conn.pending_messages), expected)
+        self.assertTrue(conn.output)  # Final ping remains, but both chats were sent.
+        a._drop(conn, "connection closed")
+        self.assertEqual(events, [])
+
+    def test_partial_application_frame_still_warns_on_disconnect(self):
+        a, _, events, _ = self.pair()
+        conn = a.peers[0].connection
+        a.broadcast("pending")
+        sock = Mock()
+        sock.send.return_value = 1
+        with patch.object(conn, "sock", sock), \
+                patch.object(a, "_active", return_value=True), patch.object(a, "_interest"):
+            a._service(conn, selectors.EVENT_WRITE, time.monotonic())
+        a._drop(conn, "connection closed")
+        self.assertTrue(any("some messages may not have arrived" in text for _, text in events))
+
+    def test_shutdown_flush_sends_existing_output_without_reconnect(self):
+        a, b, _, events = self.pair()
+        a.broadcast("goodbye")
+        with patch.object(a, "_dial") as dial:
+            self.assertEqual(a.flush(), [])
+            dial.assert_not_called()
+        a.close()
+        pump([b], lambda: bool(events))
+        self.assertEqual([text for _, text in events], ["goodbye"])
+
+    def test_ctrl_c_in_same_input_batch_flushes_last_message(self):
+        a, b, _, events = self.pair()
+        ui = ChatUI("alice")
+        ui.network = a
+        screen = Mock()
+        screen.getmaxyx.return_value = (24, 80)
+        screen.get_wch.side_effect = list("goodbye") + ["\n", "\x03"]
+        with patch("curses.raw"), patch("curses.curs_set"), patch("curses.set_escdelay"):
+            self.assertEqual(ui.run(screen), [])
+        a.close()
+        pump([b], lambda: bool(events))
+        self.assertEqual([text for _, text in events], ["goodbye"])
+
+    def test_shutdown_flush_deadline_reports_unsent_chat_without_replay(self):
+        a, _, _, _ = self.pair()
+        a.broadcast("stalled")
+        conn = a.peers[0].connection
+        pending = bytes(conn.output)
+        with patch("chat_network.time.monotonic", side_effect=[100, 100, 100.5]), \
+                patch.object(a.selector, "select", return_value=[]) as select_ready, \
+                patch.object(a, "_dial") as dial, patch.object(a, "_queue") as queue:
+            self.assertEqual(a.flush(timeout=0.5), [a.peers[0].config.label])
+            select_ready.assert_called_once_with(timeout=0.05)
+            dial.assert_not_called()
+            queue.assert_not_called()
+        self.assertEqual(bytes(conn.output), pending)
+
+    def test_shutdown_flush_failure_reports_discarded_chat(self):
+        a, b, _, _ = self.pair()
+        a.broadcast("pending")
+        b.close()
+        # Make the EOF readable before flush so the failure path is deterministic.
+        self.assertTrue(select.select([a.peers[0].connection.sock], [], [], 1)[0])
+        self.assertEqual(a.flush(), [a.peers[0].config.label])
 
     def test_backpressure_disconnects_instead_of_growing(self):
         a, _, events, _ = self.pair()

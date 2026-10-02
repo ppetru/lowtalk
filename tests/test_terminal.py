@@ -140,9 +140,15 @@ class TerminalTests(unittest.TestCase):
             pump_until(lambda: b"Resize terminal" in output)
             fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
             process.send_signal(signal.SIGWINCH)
-            os.write(master, b"\x0c/quit\n")
+            # A single key batch must flush the last message before /quit.
+            os.write(master, b"\x0cgoodbye\n/quit\n")
             pump_until(lambda: process.poll() is not None)
             self.assertEqual(process.wait(timeout=2), 0)
+            for _ in range(8):
+                network.tick()
+                absent.tick()
+            self.assertEqual(sum(text == "goodbye" for _, text in events), 1)
+            self.assertEqual(sum(text == "goodbye" for _, text in absent_events), 1)
         finally:
             if process.poll() is None:
                 process.terminate()
