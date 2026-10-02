@@ -381,7 +381,7 @@ class NetworkTests(unittest.TestCase):
         a.broadcast("new")
         pump(self.networks, lambda: any(e[1] == "new" for e in new_events))
         self.assertFalse(any(e[1] == "lost" for e in new_events))
-        self.assertEqual(sum(" online" in e[1] for e in a_events), 1)
+        self.assertEqual(a_events, [])
 
     def test_unlisted_source_gets_no_hello(self):
         events = []
@@ -420,12 +420,26 @@ class NetworkTests(unittest.TestCase):
             Network("other", a.port, [peer(free_port())], "127.0.0.1", lambda *e: None)
         self.assertEqual(caught.exception.errno, errno.EADDRINUSE)
 
-    def test_heartbeat_timeout(self):
+    def test_heartbeat_timeout_is_quiet(self):
         a, b, events, _ = self.pair()
         a.peers[0].connection.last_received = time.monotonic() - 31
         a.tick()
         self.assertEqual(a.peers[0].status, "offline")
-        self.assertTrue(any("heartbeat timed out" in text for _, text in events))
+        self.assertEqual(a.peers[0].last_error, "heartbeat timed out")
+        self.assertEqual(events, [])
+        a.peers[0].retry_at = 0
+        pump(self.networks, lambda: a.peers[0].status == b.peers[0].status == "online")
+        self.assertEqual(events, [])
+        self.assertEqual(a.peers[0].last_error, "")
+
+    def test_timeout_with_pending_data_warns(self):
+        a, _, events, _ = self.pair()
+        conn = a.peers[0].connection
+        conn.output.extend(b"pending")
+        a._drop(conn, "heartbeat timed out")
+        self.assertEqual(a.peers[0].status, "offline")
+        self.assertTrue(any("some messages may not have arrived" in text
+                            for _, text in events))
 
     def test_valid_message_is_delivered_before_malformed_frame_disconnects(self):
         a, b, _, events = self.pair()
@@ -435,6 +449,7 @@ class NetworkTests(unittest.TestCase):
         pump(self.networks, lambda: b.peers[0].status == "offline")
         self.assertEqual(sum(text == "keep this" for _, text in events), 1)
         self.assertIn("invalid JSON", b.peers[0].last_error)
+        self.assertTrue(any("invalid JSON" in text for _, text in events))
 
     def test_handshake_timeout(self):
         low, high = two_ports()
@@ -462,8 +477,8 @@ class NetworkTests(unittest.TestCase):
             for conn in connections:
                 self.assertGreaterEqual(conn.last_received, now - 10)
                 self.assertLess(len(conn.output), 100)
-        self.assertEqual(len(a_events), 1)
-        self.assertEqual(len(b_events), 1)
+        self.assertEqual(a_events, [])
+        self.assertEqual(b_events, [])
 
     def test_repeated_reconnect_after_day_long_outages(self):
         a, b, events, _ = self.pair()
@@ -494,8 +509,7 @@ class NetworkTests(unittest.TestCase):
                 self.assertTrue(any(text == f"after outage {outage}" for _, text in b_events))
                 self.assertFalse(any(text == "do not replay" for _, text in b_events))
                 self.assertEqual(a.peers[0].backoff, 1)
-        self.assertEqual(sum(text.endswith(" offline") for _, text in events), 3)
-        self.assertEqual(sum(text.endswith(" online") for _, text in events), 4)
+        self.assertEqual(events, [])
 
     def test_backpressure_disconnects_instead_of_growing(self):
         a, _, events, _ = self.pair()

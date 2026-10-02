@@ -5,8 +5,8 @@ slow peer cannot monopolize the input loop. Events are synchronous callbacks.
 All deadlines use monotonic time; wall-clock adjustments cannot alter them.
 
 Online means a valid hello, not Tailscale device presence. Any received bytes
-refresh the inactivity deadline. A ping gets a pong; pongs get no reply. Offline
-notices are debounced separately from the immediately updated connection status.
+refresh the inactivity deadline. A ping gets a pong; pongs get no reply. Routine
+connection changes update status without adding events to conversation history.
 There is no offline queue, reconnect replay, or application delivery receipt.
 """
 
@@ -38,9 +38,6 @@ class Peer:
     backoff: float = 1.0
     address_index: int = 0
     last_error: str = ""
-    # Debounce brief interruptions instead of emitting a leave/join pair.
-    announced: bool = False
-    offline_since: float | None = None
 
     @property
     def status(self) -> str:
@@ -106,7 +103,7 @@ class Network:
     def _queue(self, conn: Connection, message: dict) -> bool:
         data = encode(message)
         if len(conn.output) + len(data) > MAX_PENDING:
-            self._drop(conn, "outgoing buffer full; pending messages may be lost")
+            self._drop(conn, "outgoing buffer full; pending messages may be lost", warn=True)
             return False
         conn.output.extend(data)
         self._interest(conn)
@@ -180,7 +177,7 @@ class Network:
             except OSError:
                 sock.close()
 
-    def _drop(self, conn: Connection, reason: str) -> None:
+    def _drop(self, conn: Connection, reason: str, *, warn: bool = False) -> None:
         if conn.sock not in self.connections:
             return
         self.selector.unregister(conn.sock)
@@ -192,13 +189,10 @@ class Network:
         now = time.monotonic()
         self._retry(peer, now)
         if conn.ready:
-            peer.offline_since = now
             if conn.output:
                 self.on_event("!", f"{peer.config.label}: connection lost with pending data; "
                               "some messages may not have arrived")
-        if reason != "connection closed":
-            # Startup failures are shown in status, not repeated in scrollback.
-            if conn.ready:
+            if warn:
                 self.on_event("!", f"{peer.config.label}: {reason}")
 
     def _message(self, conn: Connection, message: dict) -> None:
@@ -211,10 +205,6 @@ class Network:
             peer.nick = message["nick"]
             peer.last_error = ""
             peer.backoff = 1.0
-            peer.offline_since = None
-            if not peer.announced:
-                self.on_event("*", f"{peer.nick} @ {conn.address} online")
-                peer.announced = True
         elif kind == "hello":
             raise ProtocolError("duplicate hello")
         elif kind == "message":
@@ -245,8 +235,10 @@ class Network:
             self._interest(conn)
         except BlockingIOError:
             pass
-        except (OSError, ProtocolError) as exc:
+        except OSError as exc:
             self._drop(conn, str(exc))
+        except ProtocolError as exc:
+            self._drop(conn, str(exc), warn=True)
 
     def tick(self) -> None:
         now = time.monotonic()
@@ -264,10 +256,6 @@ class Network:
                 conn.last_ping = now
                 self._queue(conn, {"type": "ping"})
         for peer in self.peers:
-            if (peer.offline_since is not None and peer.announced
-                    and now - peer.offline_since >= 2):
-                self.on_event("*", f"{peer.nick or peer.config.label} offline")
-                peer.announced = False
             if peer.connection is None and now >= peer.retry_at:
                 self._dial(peer, now)
 

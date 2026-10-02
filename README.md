@@ -36,7 +36,9 @@ inbound **TCP** on each participant's listening port.
   and cursor alone. Nicknames can contain up to 32 characters.
 - The top strip shows connections; `/who` shows addresses and connection errors.
   Connections recover automatically, though detecting a lost peer can take about
-  30 seconds.
+  30 seconds. Routine connects, disconnects, and timeouts do not add scrollback
+  entries. Pending-data loss and unexpected protocol errors still produce warnings.
+  `/who` shows the current connection error; reconnecting clears it.
 - Page Up / Page Down browse the last **1,000 in-memory entries**, with an unread
   count while browsing. Page down to the bottom to return to live messages.
 - `/quit` or Ctrl-C exits. `//text` sends a literal leading `/text`.
