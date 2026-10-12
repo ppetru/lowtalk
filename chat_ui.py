@@ -120,6 +120,9 @@ class ChatUI:
         self.nick = nick
         # Assigned by the entry point after the listener is successfully bound.
         self.network: Network
+        # Warn once for consecutive partial sends with the same missing peers.
+        # Their ongoing status remains visible in the connection strip and /who.
+        self.last_unavailable: frozenset[str] = frozenset()
         self.editor = Editor()
         self.messages: deque[tuple[int, str]] = deque(maxlen=1000)
         self.sequence = 0
@@ -170,14 +173,17 @@ class ChatUI:
             payload = text[1:] if text.startswith("//") else text
             queued, unavailable = self.network.broadcast(payload)
             if not queued:
+                self.last_unavailable = frozenset()
                 self.event("!", "Not sent: no recipients queued. "
                            "Draft kept; press Enter to retry.")
                 if unavailable:
                     self.event("!", "Not queued for: " + ", ".join(unavailable))
                 return True
             self.event(f"{self.nick} (you)", payload)
-            if unavailable:
+            missing = frozenset(unavailable)
+            if missing and missing != self.last_unavailable:
                 self.event("!", "Not queued for: " + ", ".join(unavailable))
+            self.last_unavailable = missing
         self.editor.take()
         if truncated:
             # A paste can include Enter before redraw. Put persistent feedback

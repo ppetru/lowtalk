@@ -65,6 +65,9 @@ If retries continue:
 - Enter sends to currently connected friends. If nothing can be queued, the draft
   and cursor stay intact for an explicit Enter retry; reconnecting never sends it
   automatically. A partial send clears the draft and lists unavailable recipients.
+  Repeated partial sends with the same unavailable friends do not repeat that
+  warning; check the connection strip or `/who` for their current status. Every
+  message still goes only to connected friends, with no replay for those missed.
   Incoming messages leave your draft and cursor alone. Nicknames can contain up
   to 32 characters.
 - The top strip shows connections and retry countdowns; `/who` shows addresses

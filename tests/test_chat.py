@@ -298,6 +298,52 @@ class EditorTests(unittest.TestCase):
         ui.draw(Screen())
         self.assertEqual(ui.network.broadcast.call_count, 2)
 
+    def test_partial_send_warns_only_when_unavailable_friends_change(self):
+        ui = ChatUI("me")
+        ui.network = SimpleNamespace(
+            peers=[], broadcast=Mock(side_effect=[
+                (["friend"], ["other", "third"]),
+                (["friend"], ["third", "other"]),
+                (["friend", "third"], ["other"]),
+                (["friend", "third", "other"], []),
+                (["friend", "third"], ["other"]),
+            ]),
+        )
+        for number, warnings in enumerate((1, 1, 2, 2, 3)):
+            ui.editor.insert(f"message {number}")
+            self.assertTrue(ui._send())
+            self.assertEqual((ui.editor.text, ui.editor.cursor), ("", 0))
+            self.assertEqual(sum("Not queued for:" in text for _, text in ui.messages),
+                             warnings)
+            self.assertEqual(sum("[me (you)]" in text for _, text in ui.messages),
+                             number + 1)
+        self.assertEqual([call.args for call in ui.network.broadcast.call_args_list],
+                         [(f"message {number}",) for number in range(5)])
+
+    def test_total_send_failure_still_warns_on_every_retry(self):
+        ui = ChatUI("me")
+        ui.network = SimpleNamespace(
+            peers=[], broadcast=Mock(side_effect=[
+                (["friend"], ["other"]),
+                ([], ["friend", "other"]),
+                ([], ["friend", "other"]),
+                (["friend"], ["other"]),
+            ]),
+        )
+        ui.editor.insert("first")
+        ui._send()
+        ui.editor.insert("retry me")
+        ui.editor.key("LEFT")
+        for _ in range(2):
+            self.assertTrue(ui._send())
+            self.assertEqual((ui.editor.text, ui.editor.cursor), ("retry me", 7))
+        self.assertEqual(sum("Not sent:" in text for _, text in ui.messages), 2)
+        self.assertEqual(sum("Not queued for:" in text for _, text in ui.messages), 3)
+        self.assertTrue(ui._send())
+        self.assertEqual((ui.editor.text, ui.editor.cursor), ("", 0))
+        self.assertEqual(sum("Not queued for:" in text for _, text in ui.messages), 4)
+        self.assertEqual(sum("[me (you)]" in text for _, text in ui.messages), 2)
+
     def test_rejected_truncated_draft_keeps_cursor_and_feedback_until_queued(self):
         ui = ChatUI("me")
         ui.network = SimpleNamespace(
