@@ -7,6 +7,7 @@ import ipaddress
 from pathlib import Path
 import socket
 import subprocess
+import sys
 from typing import cast
 
 DEFAULT_PORT = 7777
@@ -65,15 +66,20 @@ def load_peers(path: Path) -> list[PeerConfig]:
 
 def tailscale_ip() -> str | None:
     """The CLI is optional; never guess using an unrelated network interface."""
-    try:
-        result = subprocess.run(
-            ["tailscale", "ip", "-4"], capture_output=True, text=True,
-            timeout=3, check=True,
-        )
-        for line in result.stdout.splitlines():
-            address = ipaddress.IPv4Address(line.strip())
-            if address in ipaddress.IPv4Network("100.64.0.0/10"):
-                return str(address)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
+    commands = ["tailscale"]
+    if sys.platform == "darwin":
+        # The macOS GUI app includes a CLI, but often installs nothing in PATH.
+        commands.append("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+    for command in commands:
+        try:
+            result = subprocess.run(
+                [command, "ip", "-4"], capture_output=True, text=True,
+                timeout=3, check=True,
+            )
+            for line in result.stdout.splitlines():
+                address = ipaddress.IPv4Address(line.strip())
+                if address in ipaddress.IPv4Network("100.64.0.0/10"):
+                    return str(address)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
     return None

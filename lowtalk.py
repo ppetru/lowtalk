@@ -68,8 +68,12 @@ def main() -> int:
             network = Network(args.nick, args.port, peers, "0.0.0.0", ui.event)
             warning = f"Tailscale IP {local_ip} is not bindable."
         if network.bind_ip == "0.0.0.0":
-            warning = (warning or "Could not discover local Tailscale IPv4 address.") + (
+            warning = (warning or (
+                "Could not discover local Tailscale IPv4 address; "
+                "this does not necessarily mean Tailscale is offline."
+            )) + (
                 " Listening on ALL IPv4 interfaces; peer allowlist still enforced."
+                " Continuing with peer connections; /who shows connection errors."
             )
         ui.network = network
         ui.event("*", f"Listening on {network.bind_ip}:{args.port}. No logs or offline queue.")

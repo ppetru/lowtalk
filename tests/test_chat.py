@@ -4,6 +4,7 @@ from pathlib import Path
 import select
 import selectors
 import socket
+import subprocess
 import tempfile
 import time
 import unittest
@@ -102,13 +103,53 @@ class ConfigTests(unittest.TestCase):
                 parse_port(value)
 
     def test_discovery(self):
-        with patch("chat_config.subprocess.run") as run:
+        with patch("chat_config.sys.platform", "linux"), \
+                patch("chat_config.subprocess.run") as run:
             run.return_value.stdout = "100.64.1.2\n"
             self.assertEqual(tailscale_ip(), "100.64.1.2")
             run.return_value.stdout = "192.168.1.2\n"
             self.assertIsNone(tailscale_ip())
             run.side_effect = FileNotFoundError
             self.assertIsNone(tailscale_ip())
+            self.assertEqual(run.call_count, 3)
+            run.assert_called_with(
+                ["tailscale", "ip", "-4"], capture_output=True, text=True,
+                timeout=3, check=True,
+            )
+
+    def test_macos_discovery_prefers_path_cli(self):
+        with patch("chat_config.sys.platform", "darwin"), \
+                patch("chat_config.subprocess.run") as run:
+            run.return_value.stdout = "100.64.1.2\n"
+            self.assertEqual(tailscale_ip(), "100.64.1.2")
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0], ["tailscale", "ip", "-4"])
+
+    def test_macos_discovery_uses_bundled_cli(self):
+        failures = [
+            FileNotFoundError(),
+            subprocess.CalledProcessError(1, "tailscale"),
+            subprocess.TimeoutExpired("tailscale", 3),
+            SimpleNamespace(stdout="192.168.1.2\n"),
+            SimpleNamespace(stdout="invalid\n"),
+        ]
+        for failure in failures:
+            with self.subTest(failure=failure), \
+                    patch("chat_config.sys.platform", "darwin"), \
+                    patch("chat_config.subprocess.run") as run:
+                run.side_effect = [failure, SimpleNamespace(stdout="100.64.1.2\n")]
+                self.assertEqual(tailscale_ip(), "100.64.1.2")
+                self.assertEqual(run.call_count, 2)
+                run.assert_called_with(
+                    ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "ip", "-4"],
+                    capture_output=True, text=True, timeout=3, check=True,
+                )
+
+    def test_macos_discovery_failure(self):
+        with patch("chat_config.sys.platform", "darwin"), \
+                patch("chat_config.subprocess.run", side_effect=FileNotFoundError) as run:
+            self.assertIsNone(tailscale_ip())
+            self.assertEqual(run.call_count, 2)
 
 
 class ProtocolTests(unittest.TestCase):

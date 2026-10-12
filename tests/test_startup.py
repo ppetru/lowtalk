@@ -37,13 +37,19 @@ class StartupTests(unittest.TestCase):
         self.wrapper.assert_called_once()
         self.factory.return_value.close.assert_called_once()
 
-    def test_missing_cli_warns_on_broad_bind(self):
+    def test_missing_cli_warns_and_continues(self):
         self.discovery.return_value = None
         self.factory.return_value.bind_ip = "0.0.0.0"
         self.assertEqual(lowtalk.main(), 0)
         self.assertEqual(self.factory.call_args.args[3], "0.0.0.0")
-        self.assertTrue(any("ALL IPv4 interfaces" in call.args[1]
-                            for call in self.ui.event.call_args_list))
+        self.wrapper.assert_called_once()
+        warnings = [call.args[1] for call in self.ui.event.call_args_list
+                    if call.args[0] == "!"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("ALL IPv4 interfaces", warnings[0])
+        self.assertIn("does not necessarily mean Tailscale is offline", warnings[0])
+        self.assertIn("Continuing with peer connections", warnings[0])
+        self.factory.return_value.close.assert_called_once()
 
     def test_unbindable_tailscale_address_falls_back(self):
         fallback = Mock(bind_ip="0.0.0.0")
@@ -53,6 +59,9 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(self.factory.call_args.args[3], "0.0.0.0")
         self.assertTrue(any("not bindable" in call.args[1]
                             for call in self.ui.event.call_args_list))
+        self.assertTrue(any("ALL IPv4 interfaces" in call.args[1]
+                            for call in self.ui.event.call_args_list))
+        self.wrapper.assert_called_once()
         fallback.close.assert_called_once()
 
     def test_shutdown_discard_warning_is_printed_after_curses_returns(self):

@@ -35,6 +35,31 @@ implementation. Update all five Python files together and restart.
 Version mismatches appear in `/who`; failed handshakes do not repeatedly add
 warnings to scrollback.
 
+## Connection troubleshooting
+
+On macOS, Lowtalk tries both `tailscale` on PATH and the CLI bundled at
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale`. Keep the Tailscale app
+connected to your tailnet.
+
+If Lowtalk cannot discover a local Tailscale IPv4 address, it **warns and
+continues**. Discovery failure can mean the CLI is missing, not that Tailscale
+itself is offline. Lowtalk still listens and attempts peer connections.
+
+“Offline (retry in 30s)” means a chat connection has failed, not necessarily
+that Tailscale is off.
+
+If retries continue:
+
+1. Run `/who` in Lowtalk and check the connection error on both machines.
+2. Make sure both participants updated all five Python files and restarted.
+3. Check each friends file lists the **other** machine's current Tailscale IPv4
+   address and listening port (default `7777`), not its own address.
+4. From the failing machine, test `nc -vz FRIEND_TAILSCALE_IP 7777` (substitute
+   the friend's port). A timeout can indicate a Tailscale/access-rule/firewall
+   problem; refusal usually means nothing is listening at that address and port.
+   If TCP succeeds but chat does not, check `/who` for handshake errors and the
+   other machine's friends file: unlisted source addresses are rejected.
+
 ## Using it
 
 - Enter sends to currently connected friends. If nothing can be queued, the draft
