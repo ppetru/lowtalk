@@ -16,7 +16,6 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import errno
-import math
 import random
 import secrets
 import selectors
@@ -75,11 +74,8 @@ class Peer:
 
     @property
     def display_status(self) -> str:
-        status = self.status
-        remaining = self.retry_at - time.monotonic()
-        if status == "offline" and remaining > 0 and math.isfinite(remaining):
-            return f"offline (retry in {math.ceil(remaining)}s)"
-        return status
+        # Connection attempts are background work, not presence changes.
+        return "online" if self.status == "online" else "offline"
 
 
 @dataclass

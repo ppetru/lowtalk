@@ -737,15 +737,24 @@ class NetworkTests(unittest.TestCase):
             ("new bob @ 127.0.0.1", "first in new session")])
         self.assertEqual(a.peers[0].last_instance, b.instance)
 
-    def test_retry_countdown_does_not_change_semantic_status(self):
+    def test_background_retry_deadline_is_not_displayed(self):
         network = self.create("me", free_port(), [peer(free_port())], [])
         peer_state = network.peers[0]
         peer_state.retry_at = 103.1
         with patch("chat_network.time.monotonic", return_value=100):
             self.assertEqual(peer_state.status, "offline")
-            self.assertEqual(peer_state.display_status, "offline (retry in 4s)")
+            self.assertEqual(peer_state.display_status, "offline")
         with patch("chat_network.time.monotonic", return_value=104):
             self.assertEqual(peer_state.display_status, "offline")
+
+    def test_background_connecting_stays_offline_until_ready(self):
+        a, b, _, _ = self.pair(connect=False)
+        peer_state = a.peers[0]
+        a._dial(peer_state, time.monotonic())
+        self.assertEqual(peer_state.status, "connecting")
+        self.assertEqual(peer_state.display_status, "offline")
+        pump([a, b], lambda: peer_state.status == "online")
+        self.assertEqual(peer_state.display_status, "online")
 
     def test_bidirectional_delivery_and_one_connection(self):
         a, b, a_events, b_events = self.pair()

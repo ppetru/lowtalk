@@ -166,7 +166,7 @@ class ChatUI:
                 )
                 detail = f"; last error: {peer.last_error}" if peer.last_error else ""
                 self.event("*", f"{peer.nick or peer.config.label} @ {address}: "
-                           f"{peer.display_status} (port {peer.config.port}){detail}")
+                           f"{peer.status} (port {peer.config.port}){detail}")
         elif text.startswith("/") and not text.startswith("//"):
             self.event("!", "Commands: /who, /quit. Use // to send a leading slash.")
         elif text.strip():

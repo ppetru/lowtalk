@@ -45,10 +45,11 @@ If Lowtalk cannot discover a local Tailscale IPv4 address, it **warns and
 continues**. Discovery failure can mean the CLI is missing, not that Tailscale
 itself is offline. Lowtalk still listens and attempts peer connections.
 
-“Offline (retry in 30s)” means a chat connection has failed, not necessarily
-that Tailscale is off.
+“offline” means no chat connection is established, not necessarily that Tailscale
+is off. Lowtalk retries quietly in the background, without countdowns or
+“connecting” flashes in the top strip.
 
-If retries continue:
+If a friend stays offline unexpectedly:
 
 1. Run `/who` in Lowtalk and check the connection error on both machines.
 2. Make sure both participants updated all five Python files and restarted.
@@ -70,8 +71,8 @@ If retries continue:
   message still goes only to connected friends, with no replay for those missed.
   Incoming messages leave your draft and cursor alone. Nicknames can contain up
   to 32 characters.
-- The top strip shows connections and retry countdowns; `/who` shows addresses
-  and connection errors.
+- The top strip shows friends as online or offline; `/who` shows addresses,
+  detailed connection status, and connection errors.
   Connections recover automatically, though detecting a lost peer can take about
   30 seconds. Routine connects, disconnects, and timeouts do not add scrollback
   entries. Pending-data loss and unexpected protocol errors still produce warnings.
